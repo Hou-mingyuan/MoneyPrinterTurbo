@@ -1,5 +1,6 @@
 import base64
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 import io
 import math
 import os
@@ -23,6 +24,8 @@ from PIL import Image, UnidentifiedImageError
 from app.config import config
 from app.models.schema import ImageMotion, MaterialInfo, VideoAspect, VideoConcatMode
 from app.services import (
+    codex_image,
+    generation_progress,
     infistar_video,
     jalapeno_video,
     material_cache,
@@ -66,6 +69,19 @@ class OpenAIImagePaidResultError(RuntimeError):
 
 class OpenAIImageUnconfirmedError(OpenAIImagePaidResultError):
     """A paid image request may have succeeded without returning a response."""
+
+
+class CodexImageMaterialError(OpenAIImagePaidResultError):
+    """Stop the image loop while retaining a translatable, sanitized error."""
+
+    def __init__(self, error):
+        self.key = error.key
+        self.params = error.params
+        messages = {
+            "codex.image.save_failed": "Could not save the generated Codex image. Generation stopped without retrying.",
+            "codex.image.render_failed": "Could not render the generated Codex image. Generation stopped without retrying.",
+        }
+        super().__init__(messages.get(self.key, str(error)))
 
 
 def _safe_public_url(value: Any) -> str | None:
@@ -275,6 +291,51 @@ def _is_cloudflare_challenge(response: requests.Response) -> bool:
     return "just a moment" in body or "/cdn-cgi/challenge-platform/" in body
 
 
+def _stock_search_results(
+    provider: str, response: Any, results_key: str
+) -> list | None:
+    """
+    Return the result list of a Pexels or Coverr search response.
+
+    When the search failed, log why and return None. As in the Pixabay search,
+    the log gets the status and content type but not the response body, and a
+    401 names the setting that holds the rejected key.
+    """
+    status_code = int(getattr(response, "status_code", 200))
+    headers = getattr(response, "headers", {}) or {}
+    content_type = str(headers.get("content-type", "")) or "unknown"
+    if status_code == 401:
+        logger.error(
+            f"{provider} rejected the API key: status=401. "
+            f"Check {provider}_api_keys in config.toml."
+        )
+        return None
+    if status_code == 429:
+        logger.error(
+            f"{provider} API rate limit exceeded: "
+            f"status=429, retry_after={headers.get('retry-after') or 'unknown'}"
+        )
+        return None
+    if status_code >= 400:
+        logger.error(
+            f"{provider} search request failed: "
+            f"status={status_code}, content_type={content_type}"
+        )
+        return None
+    try:
+        body = response.json()
+    except ValueError:
+        logger.error(
+            f"{provider} returned an unexpected non-JSON response: "
+            f"status={status_code}, content_type={content_type}"
+        )
+        return None
+    if not isinstance(body, dict) or not isinstance(body.get(results_key), list):
+        logger.error(f"{provider} video search returned an unsupported response")
+        return None
+    return body[results_key]
+
+
 def _matches_video_aspect(
     width: Any,
     height: Any,
@@ -368,14 +429,10 @@ def search_videos_pexels(
             verify=_get_tls_verify(),
             timeout=(30, 60),
         )
-        response = r.json()
+        videos = _stock_search_results("pexels", r, "videos")
+        if videos is None:
+            return []
         video_items = []
-        if not isinstance(response, dict) or not isinstance(
-            response.get("videos"), list
-        ):
-            logger.error("pexels video search returned an unsupported response")
-            return video_items
-        videos = response["videos"]
         # loop through each video in the result
         for v in videos:
             if not isinstance(v, dict):
@@ -639,16 +696,12 @@ def search_videos_coverr(
             verify=_get_tls_verify(),
             timeout=(30, 60),
         )
-        response = r.json()
+        hits = _stock_search_results("coverr", r, "hits")
+        if hits is None:
+            return []
         video_items: List[MaterialInfo] = []
 
-        if not isinstance(response, dict) or not isinstance(
-            response.get("hits"), list
-        ):
-            logger.error("coverr video search returned an unsupported response")
-            return video_items
-
-        for v in response["hits"]:
+        for v in hits:
             if not isinstance(v, dict):
                 continue
             # duration 在不同响应里可能是 number(11.625) 或 string("10.500000")
@@ -851,6 +904,7 @@ def generate_videos_wavespeed(
 
     # 提交 POST 绝不自动重试：请求可能已经在远端创建了付费任务，重发会造成
     # 重复生成和重复扣费（与官方 SDK 的 submission 策略一致）。
+    generation_progress.submitting("wavespeed")
     try:
         submit_response = trace_http_call(
             "POST", requests.post,
@@ -982,6 +1036,7 @@ def _wait_for_wavespeed_prediction(
     :class:`WaveSpeedUnconfirmedTaskError`，由调用方终止整个生成流程。
     """
     deadline = time.monotonic() + WAVESPEED_RUN_TIMEOUT_SECONDS
+    generation_progress.remote("wavespeed", prediction_id)
     consecutive_failures = 0
     while True:
         try:
@@ -1028,6 +1083,7 @@ def _wait_for_wavespeed_prediction(
                     prediction_id=prediction_id,
                 ) from e
             consecutive_failures += 1
+            generation_progress.remote("wavespeed", prediction_id, retrying=True)
             if consecutive_failures > WAVESPEED_MAX_POLL_RETRIES:
                 raise WaveSpeedUnconfirmedTaskError(
                     "wavespeed prediction polling failed after "
@@ -1050,6 +1106,7 @@ def _wait_for_wavespeed_prediction(
         # 拿到一次有效响应就重置计数，只有连续失败才消耗重试额度。
         consecutive_failures = 0
         status = str(result_data.get("status") or "")
+        generation_progress.remote("wavespeed", prediction_id, status)
         if status == "completed":
             return result_data
         if status in WAVESPEED_FAILURE_STATUSES:
@@ -1156,7 +1213,49 @@ def _describe_download_progress(
     return f"{downloaded_mb:.1f} MB, {speed:.2f} MB/s"
 
 
+def _is_valid_video_file(video_path: str) -> bool:
+    """Return whether a video satisfies the cache publication contract."""
+    clip = None
+    try:
+        # Decode the complete stream first. Unlike MoviePy's metadata probe,
+        # this validator distinguishes confirmed bad media from an FFmpeg
+        # execution failure through MaterialUploadError/MaterialServiceError.
+        material_upload._validate_video(video_path)
+    except material_upload.MaterialServiceError:
+        raise
+    except material_upload.MaterialUploadError as exc:
+        logger.warning(f"invalid video file: {video_path} => {str(exc)}")
+        return False
+    except Exception as exc:
+        raise material_upload.MaterialServiceError(
+            "unexpected failure while validating video content"
+        ) from exc
+
+    try:
+        clip = VideoFileClip(video_path)
+        duration = clip.duration
+        fps = clip.fps
+        return bool(duration > 0 and fps > 0)
+    except Exception as exc:
+        # Complete decoding already succeeded. A MoviePy failure at this point
+        # is an unavailable metadata probe (for example, its configured FFmpeg
+        # executable is missing), not proof that the cached bytes are corrupt.
+        raise material_upload.MaterialServiceError(
+            "failed to probe video metadata"
+        ) from exc
+    finally:
+        if clip is not None:
+            try:
+                clip.close()
+            except Exception as close_error:
+                logger.warning(
+                    f"failed to close video clip: {video_path}, "
+                    f"error: {str(close_error)}"
+                )
+
+
 def save_video(video_url: str, save_dir: str = "") -> str:
+    generation_progress.downloading()
     if not save_dir:
         save_dir = utils.storage_dir("cache_videos")
 
@@ -1170,10 +1269,52 @@ def save_video(video_url: str, save_dir: str = "") -> str:
     video_id = f"vid-{url_hash}"
     video_path = f"{save_dir}/{video_id}.mp4"
 
-    # if video already exists, return the path
-    if os.path.exists(video_path) and os.path.getsize(video_path) > 0:
-        logger.info(f"video already exists: {video_path}")
-        return video_path
+    # A nonempty path can still be a truncated file left by an older release,
+    # a manual copy, or storage corruption. Validate it before declaring a hit
+    # so the cache can repair itself instead of failing on every later render.
+    try:
+        cached_stat = os.stat(video_path)
+    except FileNotFoundError:
+        cached_stat = None
+    if cached_stat is not None and cached_stat.st_size > 0:
+        generation_progress.verifying()
+        try:
+            cached_video_is_valid = _is_valid_video_file(video_path)
+        except material_upload.MaterialServiceError as exc:
+            # Do not destroy the only local copy because the validation service
+            # is temporarily unavailable. Reusing the existing nonempty cache
+            # preserves the pre-validation behavior and avoids an unrecoverable
+            # download attempt when a signed source URL has expired.
+            logger.warning(
+                f"video cache validation unavailable; preserving existing file: "
+                f"{video_path} => {str(exc)}"
+            )
+            return video_path
+        if cached_video_is_valid:
+            logger.info(f"video already exists: {video_path}")
+            return video_path
+
+        logger.warning(f"discarding invalid cached video: {video_path}")
+        try:
+            current_stat = os.stat(video_path)
+            cached_identity = (
+                cached_stat.st_dev,
+                cached_stat.st_ino,
+                cached_stat.st_size,
+                cached_stat.st_mtime_ns,
+            )
+            current_identity = (
+                current_stat.st_dev,
+                current_stat.st_ino,
+                current_stat.st_size,
+                current_stat.st_mtime_ns,
+            )
+            # Do not delete a valid replacement published by another worker
+            # while this process was validating the stale entry.
+            if current_identity == cached_identity:
+                os.remove(video_path)
+        except FileNotFoundError:
+            pass
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
@@ -1222,6 +1363,7 @@ def save_video(video_url: str, save_dir: str = "") -> str:
                         now = time.monotonic()
                         if now - last_report_at >= _DOWNLOAD_HEARTBEAT_SECONDS:
                             last_report_at = now
+                            generation_progress.downloading(downloaded_bytes, declared_size)
                             # 只记录缓存文件名：下载地址可能带签名或密钥。
                             logger.info(
                                 f"downloading video {video_id}.mp4: "
@@ -1235,29 +1377,9 @@ def save_video(video_url: str, save_dir: str = "") -> str:
         if os.path.getsize(temp_path) == 0:
             return ""
 
-        clip = None
-        try:
-            clip = VideoFileClip(temp_path)
-            duration = clip.duration
-            fps = clip.fps
-            # Container duration and an initial frame do not prove the rest of
-            # a faststart MP4 arrived. Validate every video packet before a
-            # nonempty cache entry becomes reusable by later tasks.
-            material_upload._validate_video(temp_path)
-            if not (duration > 0 and fps > 0):
-                logger.warning(f"invalid video file: {temp_path} => invalid duration or fps")
-                return ""
-        except Exception as e:
-            logger.warning(f"invalid video file: {temp_path} => {str(e)}")
+        generation_progress.verifying()
+        if not _is_valid_video_file(temp_path):
             return ""
-        finally:
-            if clip is not None:
-                try:
-                    clip.close()
-                except Exception as close_error:
-                    logger.warning(
-                        f"failed to close video clip: {temp_path}, error: {str(close_error)}"
-                    )
 
         os.replace(temp_path, video_path)
         temp_path = ""
@@ -1704,6 +1826,7 @@ def generate_images_openai(
         f"generating image via openai-compatible endpoint: model={model}, "
         f"term={search_term!r}, size={image_size}"
     )
+    generation_progress.submitting("openai_image")
     image_bytes, failure_detail = _request_openai_image(endpoint, payload)
     if image_bytes is None:
         logger.error(
@@ -1739,6 +1862,50 @@ def generate_images_openai(
     return [item]
 
 
+def generate_images_codex(
+    search_term: str,
+    minimum_duration: int,
+    video_aspect: VideoAspect = VideoAspect.portrait,
+    save_dir: str = "",
+    *,
+    context=None,
+) -> List[MaterialInfo]:
+    """Obtain one Codex image using the existing PNG material representation."""
+    aspect = VideoAspect(video_aspect)
+    if minimum_duration <= 0:
+        return []
+    try:
+        context = context if context is not None else codex_image.capture_context()
+        codex_image.assert_current(context)
+        # Independent of the OpenAI-compatible provider's template and settings.
+        prompt = (
+            f"Create one image depicting: {search_term}. "
+            f"Compose the image for a {aspect.value} video frame."
+        )
+        generation_progress.submitting("codex_image")
+        image_bytes = codex_image.generate_image(prompt, context)
+        codex_image.assert_current(context)
+        try:
+            image_path, width, height = _save_openai_image_file(image_bytes, save_dir)
+        except _OpenAIImageDecodeError:
+            raise codex_image.CodexImageError("codex.image.invalid_result") from None
+        except OSError:
+            raise codex_image.CodexImageError("codex.image.save_failed") from None
+        codex_image.assert_current(context)
+    except codex_image.CodexImageError as error:
+        raise CodexImageMaterialError(error) from None
+    item = MaterialInfo()
+    item.provider = "codex_image"
+    item.url = image_path
+    item.duration = max(int(minimum_duration), 1)
+    item.source_info = {
+        "provider": "codex_image",
+        "search_term": search_term,
+        "rendition": {"id": None, "width": width, "height": height},
+    }
+    return [item]
+
+
 def _render_openai_image_video(
     image_path: str, clip_duration: int, image_motion: ImageMotion = ImageMotion.zoom
 ) -> str:
@@ -1768,6 +1935,9 @@ def _download_videos_openai_image_on_demand(
     max_clip_duration: int,
     material_directory: str,
     image_motion: ImageMotion = ImageMotion.zoom,
+    image_generator: Callable[..., List[MaterialInfo]] | None = None,
+    provider: str = "openai_image",
+    codex_image_context=None,
 ) -> List[str]:
     """
     按脚本片段顺序逐张生成 OpenAI 兼容文生图素材，凑够所需总时长立即停止。
@@ -1802,13 +1972,29 @@ def _download_videos_openai_image_on_demand(
         _persist_material_sources(task_id, material_sources)
         return video_paths
 
+    if image_generator is None:
+        image_generator = generate_images_openai
+    generation_options = {}
+    if provider == "codex_image":
+        try:
+            codex_image_context = (
+                codex_image_context
+                if codex_image_context is not None
+                else codex_image.capture_context()
+            )
+            codex_image.assert_current(codex_image_context)
+        except codex_image.CodexImageError as error:
+            raise CodexImageMaterialError(error) from None
+        generation_options["context"] = codex_image_context
+
     for search_term in search_terms:
         try:
-            items = generate_images_openai(
+            items = image_generator(
                 search_term=search_term,
                 minimum_duration=max_clip_duration,
                 video_aspect=video_aspect,
                 save_dir=material_directory,
+                **generation_options,
             )
         except OpenAIImagePaidResultError:
             _persist_material_sources(task_id, material_sources)
@@ -1819,9 +2005,19 @@ def _download_videos_openai_image_on_demand(
             )
             if not video_file:
                 _persist_material_sources(task_id, material_sources)
+                if provider == "codex_image":
+                    raise CodexImageMaterialError(
+                        codex_image.CodexImageError("codex.image.render_failed")
+                    )
                 raise OpenAIImagePaidResultError(
                     "generated image could not be rendered locally"
                 )
+            if provider == "codex_image":
+                try:
+                    codex_image.assert_current(codex_image_context)
+                except codex_image.CodexImageError as error:
+                    _persist_material_sources(task_id, material_sources)
+                    raise CodexImageMaterialError(error) from None
             logger.info(f"image material rendered: {video_file}")
             video_paths.append(video_file)
             try:
@@ -1831,7 +2027,7 @@ def _download_videos_openai_image_on_demand(
                 # 素材当作失败，更不能阻断视频生成。
                 logger.warning(
                     "failed to prepare generated material source record: "
-                    f"provider=openai_image, "
+                    f"provider={provider}, "
                     f"error={type(source_error).__name__}, detail={source_error}"
                 )
             total_duration += min(max_clip_duration, item.duration)
@@ -1969,7 +2165,7 @@ def _search_terms_in_parallel(
                 logger.error(
                     "failed to search material videos: "
                     f"search_term={search_term!r}, "
-                    f"error={type(exc).__name__}"
+                    f"error={type(exc).__name__}, detail={exc}"
                 )
                 items = []
             logger.info(f"found {len(items)} videos for '{search_term}'")
@@ -1983,6 +2179,7 @@ def _search_terms_in_parallel(
     ) as executor:
         for search_term in search_terms:
             futures[executor.submit(
+                copy_context().run,
                 logging_utils.bind_log_scope(search_videos),
                 search_term,
                 minimum_duration,
@@ -2111,6 +2308,7 @@ def _download_materials_in_parallel(
     ) as executor:
         for search_term, item in materials:
             futures[executor.submit(
+                copy_context().run,
                 logging_utils.bind_log_scope(save_video),
                 item.url,
                 material_directory,
@@ -2172,6 +2370,7 @@ def download_videos(
     progress_callback: Callable[[float], None] | None = None,
     image_motion: ImageMotion = ImageMotion.zoom,
     jalapeno_video_endpoint: volcengine_seedance.SeedanceEndpoint | None = None,
+    codex_image_context=None,
 ) -> List[str]:
     """
     搜索并下载覆盖配音时长所需的素材，返回本地文件路径。
@@ -2274,10 +2473,17 @@ def download_videos(
             max_clip_duration=max_clip_duration,
             material_directory=material_directory,
         )
-    if source == "openai_image":
+    if source in {"openai_image", "codex_image"}:
         # 与 WaveSpeed 相同的按需付费语义：文生图按张计费，逐段生成、凑够
         # 所需时长立即停止。生成结果是一次性的本地图片文件，也不参与 24
         # 小时搜索缓存——缓存会让不同任务反复拿到同一张图。
+        image_options = {}
+        if source == "codex_image":
+            image_options = {
+                "image_generator": generate_images_codex,
+                "provider": source,
+                "codex_image_context": codex_image_context,
+            }
         return _download_videos_openai_image_on_demand(
             task_id=task_id,
             search_terms=search_terms,
@@ -2286,6 +2492,7 @@ def download_videos(
             max_clip_duration=max_clip_duration,
             material_directory=material_directory,
             image_motion=image_motion,
+            **image_options,
         )
 
     if match_script_order:
@@ -3005,13 +3212,19 @@ def _download_videos_by_script_order(
         minimum_duration=max_clip_duration,
         video_aspect=video_aspect,
     ):
+        # A topic the script returns to gets the same search results again. Dedupe
+        # only within one term, so the repeated term keeps its slot on the timeline;
+        # candidates another term already took are skipped when a round is built.
         term_items = []
+        term_urls = set()
         for item in video_items:
-            if item.url in valid_video_urls:
+            if item.url in term_urls:
                 continue
             term_items.append(item)
-            valid_video_urls.add(item.url)
-            found_duration += item.duration
+            term_urls.add(item.url)
+            if item.url not in valid_video_urls:
+                valid_video_urls.add(item.url)
+                found_duration += item.duration
 
         if term_items:
             candidate_groups.append((search_term, term_items))
@@ -3030,18 +3243,22 @@ def _download_videos_by_script_order(
     # 每个关键词独立推进候选下标：只有本轮真正被选中下载的候选才推进，
     # 未被选中的候选保留到下一轮，避免被整轮统一的下标跳过。
     next_candidate_indices = [0] * len(candidate_groups)
+    picked_urls = set()
     while candidate_groups and total_duration <= audio_duration:
-        round_materials = [
-            (
-                group_position,
-                search_term,
-                term_items[next_candidate_indices[group_position]],
-            )
-            for group_position, (search_term, term_items) in enumerate(
-                candidate_groups
-            )
-            if next_candidate_indices[group_position] < len(term_items)
-        ]
+        round_materials = []
+        round_urls = set()
+        for group_position, (search_term, term_items) in enumerate(candidate_groups):
+            # Skip candidates an earlier round or an earlier group of this round took.
+            index = next_candidate_indices[group_position]
+            while index < len(term_items) and (
+                term_items[index].url in picked_urls
+                or term_items[index].url in round_urls
+            ):
+                index += 1
+            next_candidate_indices[group_position] = index
+            if index < len(term_items):
+                round_materials.append((group_position, search_term, term_items[index]))
+                round_urls.add(term_items[index].url)
         if not round_materials:
             break
 
@@ -3056,8 +3273,9 @@ def _download_videos_by_script_order(
         # _select_materials_until_duration 返回候选列表的前缀子集，
         # 因此前 len(selected_materials) 个即本轮实际尝试下载的候选，
         # 只推进这些候选所在分组的下标。
-        for group_position, _, _ in round_materials[: len(selected_materials)]:
+        for group_position, _, item in round_materials[: len(selected_materials)]:
             next_candidate_indices[group_position] += 1
+            picked_urls.add(item.url)
 
         downloaded_materials = _download_materials_in_parallel(
             materials=selected_materials,
