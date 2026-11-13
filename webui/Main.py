@@ -2836,8 +2836,11 @@ def _format_file_size(size_bytes):
     size = float(max(0, size_bytes))
     units = ("B", "KB", "MB", "GB", "TB")
     for unit in units:
-        if size < 1024 or unit == units[-1]:
-            return f"{size:.0f} {unit}" if unit in ("B", "KB") else f"{size:.2f} {unit}"
+        # B/KB use integer rounding, MB+ use two decimals. Step to the next
+        # unit when that rounding would display as 1024 of the current unit.
+        label = f"{size:.0f}" if unit in ("B", "KB") else f"{size:.2f}"
+        if float(label) < 1024 or unit == units[-1]:
+            return f"{label} {unit}"
         size /= 1024
     return f"{size_bytes} B"
 
@@ -6749,6 +6752,17 @@ def _get_voice_preview_sample(voice_name: str) -> str:
         vietnamese_chars = set("àáâãèéêìíòóôõùúýăđơưÀÁÂÃÈÉÊÌÍÒÓÔÕÙÚÝĂĐƠƯ")
         if any(char in vietnamese_chars for char in display):
             return "Xin chào, đây là đoạn âm thanh thử nghiệm giọng nói."
+    # Edge and Azure voice names start with their locale, as in
+    # en-US-JennyNeural-Female, and the voice reads the language of that
+    # locale. Edge returns no audio for text a voice cannot read: an en-US
+    # voice gets none for the Chinese sample. Use the sample in the voice's
+    # language, or the English one when no WebUI language has a sample.
+    if voice.is_azure_v1_voice(voice_name) or voice.is_azure_v2_voice(voice_name):
+        language = voice_name.split("-", 1)[0].lower()
+        for code in (language, "en"):
+            sample = locales.get(code, {}).get("Translation", {}).get("Voice Example")
+            if sample:
+                return sample
     return tr("Voice Example")
 
 
