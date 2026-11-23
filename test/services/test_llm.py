@@ -680,11 +680,20 @@ class TestLiteLLMProvider(unittest.TestCase):
         )
         uberllm = get_llm_provider("uberllm")
         self.assertEqual(uberllm.default_model, "deepseek/deepseek-v4-flash")
-        self.assertEqual(uberllm.default_base_url, "https://api.uberllm.dev/v1")
+        self.assertEqual(uberllm.default_base_url, "https://api.martllm.com/v1")
         self.assertEqual(uberllm.adapter, "openai_compatible")
         self.assertTrue(uberllm.requires_api_key)
-        self.assertEqual(uberllm.api_key_url, "https://uberllm.dev/signup")
-        self.assertEqual(uberllm.model_docs_url, "https://uberllm.dev/models")
+        self.assertEqual(uberllm.api_key_url, "https://martllm.com/signup")
+        self.assertEqual(uberllm.model_docs_url, "https://martllm.com/models")
+        atmorouter = get_llm_provider("atmorouter")
+        self.assertEqual(atmorouter.default_model, "zai/glm-5.3")
+        self.assertEqual(atmorouter.default_base_url, "https://atmorouter.dev/v1")
+        self.assertEqual(atmorouter.adapter, "openai_compatible")
+        self.assertTrue(atmorouter.requires_api_key)
+        self.assertEqual(
+            atmorouter.api_key_url, "https://atmorouter.dev/dashboard/keys"
+        )
+        self.assertEqual(atmorouter.model_docs_url, "https://atmorouter.dev/models")
         iflytek = get_llm_provider("iflytek")
         self.assertEqual(iflytek.default_model, "spark-x2.5")
         self.assertEqual(
@@ -773,6 +782,7 @@ class TestLiteLLMProvider(unittest.TestCase):
                 "cloudgpu",
                 "cheapaimodel",
                 "uberllm",
+                "atmorouter",
                 "ollama",
                 "claude_code",
                 "oneapi",
