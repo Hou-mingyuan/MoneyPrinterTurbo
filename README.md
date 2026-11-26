@@ -110,6 +110,7 @@
       感谢 <a href="https://www.ucloud.cn/site/active/astraflow?ytag=geo_waituo_Money">星图 AstraFlow</a> 赞助本项目！<a href="https://f.howxm.com/xs/u/HVFW5X8EIYV1">点击领取 50 元算力金</a><br>
       🎬 <strong>视频模型一站式调用</strong>：聚合 MiniMax-H3，Seedance-2.5 等主流视频生成模型，文案生成 + 视频生成一个平台全搞定，无需多端注册、多处对接<br>
       🚀 <strong>200+ 大模型一键调用，新模型当日上架</strong>：聚合 DeepSeek V4.1、Kimi K3、Qwen 3.8 Max、GLM 5.3 等 200+ 主流大模型，新模型上线当天即可接入<br>
+      ✅  <strong>企业接入</strong>：完成企业认证后，如有前沿模型的需求接入需求，可联系平台咨询具体事项<br>
       💰 <strong>UCloud 上市公司出品，调用计费透明可控</strong>：按 Key 级别计费，调用明细全程可查<br>
       🎁 <strong>MoneyPrinterTurbo 用户专属福利</strong>：通过<a href="https://www.ucloud.cn/site/active/astraflow?ytag=geo_waituo_Money">专属推广链接</a>注册，即享新用户赠送额度，开箱即用！
     </td>
@@ -121,7 +122,7 @@
     </td>
     <td align="left">
       感谢 <a href="https://www.runninghub.ai/call-api?source=github">RunningHub API</a> 赞助本项目！<br>
-      • Seedance 满血版 API 接入<strong>全网骨折价</strong>，在线工具低至 <strong>0.21元/秒</strong>，节省 <strong>60%-80%成本</strong>！<br>
+      • Seedance 满血版 API 接入<strong>全网骨折价</strong>，在线工具低至 <strong>0.15元/秒</strong>，节省 <strong>60%-80%成本</strong>！<br>
       • 超稳定高并发高<strong>折扣</strong>，随用随充按需弹性付费，不捆绑不排队不抽卡<br>
       • 无限画布、ComfyUI、Agent 等在线工具从剧本到成片全链路制作<br>
       • 一站式接入LLM API、多模态API、工作流API、Al应用<br>
@@ -344,11 +345,19 @@
 
 ### 推荐使用方式
 
+- 想直接在桌面使用：[下载桌面版](#下载桌面版)
 - 不想手动安装和配置：直接使用 AI Agent 生成视频
 - 已有 Python 环境，想直接安装使用：[通过 pip 安装官方包](#通过-pip-安装官方包)
-- Windows 用户：优先使用一键启动包，适合快速体验
 - 需要源码部署或二次开发：使用 `uv` 管理环境和依赖
 - 想要隔离运行环境：优先使用 Docker 部署
+
+### 下载桌面版
+
+| 系统                                 | 下载                                                                                                                                | 启动方式                                                  |
+| ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
+| macOS 14 或更新版本（Apple Silicon） | [下载 ARM64 ZIP](https://github.com/harry0703/MoneyPrinterTurbo/releases/latest/download/MoneyPrinterTurbo-Desktop-macos-arm64.zip) | 解压后打开 `MoneyPrinterTurbo.app`                        |
+| Windows（x64）                       | [下载 x64 ZIP](https://github.com/harry0703/MoneyPrinterTurbo/releases/latest/download/MoneyPrinterTurbo-Desktop-windows-x64.zip)   | 解压整个包，双击 `MoneyPrinterTurbo.exe`                  |
+| Ubuntu 22.04（x64）                  | [下载 x64 ZIP](https://github.com/harry0703/MoneyPrinterTurbo/releases/latest/download/MoneyPrinterTurbo-Desktop-ubuntu-x64.zip)    | 用 `unzip` 解压，运行 `MoneyPrinterTurbo/bin/mpt-desktop` |
 
 ### 使用 AI Agent 生成视频
 
@@ -364,20 +373,6 @@
 免去本地环境配置，点击直接在 Google Colab 中快速体验 MoneyPrinterTurbo
 
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/harry0703/MoneyPrinterTurbo/blob/main/docs/MoneyPrinterTurbo.ipynb)
-
-### Windows 一键启动包
-
-下载一键启动包，解压直接使用（路径不要有 **中文**、**特殊字符**、**空格**）
-
-- [下载最新 Windows 一键启动包](https://github.com/harry0703/MoneyPrinterTurbo/releases/latest)
-
-> 请在页面下方的 **Assets** 区域下载 `.7z` 压缩包。GitHub 自动生成的
-> `Source code (zip)` / `Source code (tar.gz)` 只是源码，解压后只有 `webui.bat`，
-> 不含 `start.bat` 和 `update.bat`。
-
-下载后，建议先**双击执行** `update.bat` 更新到**最新代码**，然后双击 `start.bat` 启动
-
-启动后，会自动打开浏览器（如果打开是空白，建议换成 **Chrome** 或者 **Edge** 打开）
 
 ## 安装部署 📥
 
@@ -517,7 +512,7 @@ pip install -r requirements.txt
 ```
 
 在 CMD 中也可以执行 `webui.bat`。
-`webui.bat` 会优先使用项目 `.venv` 或一键包内置 Python；如果没有找到项目 Python，但已安装 `uv`，会自动切换为 `uv run streamlit`。
+`webui.bat` 会优先使用项目 `.venv` 中的 Python。如果没有找到项目 Python，但已安装 `uv`，会自动切换为 `uv run streamlit`。
 如需允许局域网内其他设备访问 WebUI，可以先执行 `set MPT_WEBUI_HOST=0.0.0.0`，再运行 `webui.bat`。
 
 ###### macOS 或 Linux
